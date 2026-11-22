@@ -411,16 +411,103 @@ def tts_edge(teks, path_wav):
     return False
 
 
+def rapikan_suara(path_wav, jumlah_kata):
+    """Buang bunyi aneh di ujung rekaman, perlambat kalau terlalu cepat, beri fade-out halus."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(path_wav) as w:
+        sr = w.getframerate()
+        x = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+    langkah = int(sr * 0.02)
+    n = len(x) // langkah
+    if n < 10:
+        return
+    rms = np.sqrt((x[: n * langkah].reshape(n, langkah) ** 2).mean(axis=1))
+    bunyi = rms > max(0.01, rms.max() * 0.03)
+    # tutup celah sunyi yang sangat pendek (<= 60 ms) supaya satu bunyi tidak terpecah
+    i = 0
+    while i < n:
+        if not bunyi[i]:
+            j = i
+            while j < n and not bunyi[j]:
+                j += 1
+            if 0 < i and j < n and j - i <= 3:
+                bunyi[i:j] = True
+            i = j
+        else:
+            i += 1
+
+    # potong sunyi di awal
+    awal = int(np.argmax(bunyi))
+    awal = max(awal - 5, 0)
+    # buang "bunyi pendek" di ujung yang terpisah oleh jeda (artefak TTS), maksimal 2 kali
+    akhir = n
+    for _ in range(2):
+        idx = np.where(bunyi[:akhir])[0]
+        if len(idx) == 0:
+            break
+        ujung = idx[-1] + 1
+        mulai_ekor = ujung
+        while mulai_ekor > 0 and bunyi[mulai_ekor - 1]:
+            mulai_ekor -= 1
+        panjang_ekor = (ujung - mulai_ekor) * 0.02
+        jeda = 0
+        j = mulai_ekor - 1
+        while j >= 0 and not bunyi[j]:
+            jeda += 1
+            j -= 1
+        if panjang_ekor < 0.45 and jeda * 0.02 >= 0.1 and j > 0:
+            log(f"  Membuang bunyi aneh {panjang_ekor:.2f} dtk di ujung rekaman.")
+            akhir = j + 1
+        else:
+            akhir = ujung
+            break
+    akhir = min(akhir + 8, n)
+    potong = x[awal * langkah: akhir * langkah]
+    lama = len(potong) / sr
+
+    # terlalu cepat? (narasi enak didengar sekitar 2,4-2,7 kata per detik)
+    kecepatan = jumlah_kata / max(lama, 1)
+    tempo = 1.0
+    if kecepatan > 2.9:
+        tempo = max(2.6 / kecepatan, 0.8)
+        log(f"  Narasi terlalu cepat ({kecepatan:.1f} kata/dtk), diperlambat ke {tempo:.2f}x.")
+
+    sementara = path_wav + ".tmp.wav"
+    with wave.open(sementara, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((np.clip(potong, -1, 1) * 32767).astype(np.int16).tobytes())
+    lama_baru = lama / tempo
+    filt = []
+    if tempo != 1.0:
+        filt.append(f"atempo={tempo:.3f}")
+    filt.append(f"afade=t=out:st={max(lama_baru - 0.25, 0):.2f}:d=0.25")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", sementara, "-af", ",".join(filt),
+         "-ar", str(sr), "-ac", "1", path_wav],
+        check=True,
+    )
+    os.remove(sementara)
+
+
 def karyawan_narator(teks, path_wav):
     """Membacakan SELURUH kisah sekaligus supaya intonasinya mengalir alami."""
     log("  Narator: membacakan kisah...")
-    if MESIN_SUARA in ("auto", "gemini") and tts_gemini(teks, path_wav):
-        return
-    if MESIN_SUARA == "gemini":
-        log("  Gemini TTS gagal, pakai cadangan edge-tts.")
-    if tts_edge(teks, path_wav):
-        return
-    sys.exit("[GAGAL] Suara narasi tidak berhasil dibuat.")
+    jadi = MESIN_SUARA in ("auto", "gemini") and tts_gemini(teks, path_wav)
+    if not jadi:
+        if MESIN_SUARA == "gemini":
+            log("  Gemini TTS gagal, pakai cadangan edge-tts.")
+        jadi = tts_edge(teks, path_wav)
+    if not jadi:
+        sys.exit("[GAGAL] Suara narasi tidak berhasil dibuat.")
+    try:
+        rapikan_suara(path_wav, len(teks.split()))
+    except Exception as e:  # noqa: BLE001
+        log(f"  (merapikan suara dilewati: {e})")
 
 
 # ---------------------------------------------------------------- Karyawan 6
@@ -626,8 +713,26 @@ def ass_waktu(detik):
     return f"{j}:{m:02d}:{d:05.2f}"
 
 
+def kelompok_kata(kata):
+    """Bagi kata jadi potongan pendek (maks 4 kata / 24 huruf), putus di tanda baca."""
+    grup, kini = [], []
+    for i, k in enumerate(kata):
+        calon = " ".join(kata[x] for x in kini + [i])
+        if kini and (len(kini) >= 4 or len(calon) > 24):
+            grup.append(kini)
+            kini = []
+        kini.append(i)
+        if k[-1:] in ".,!?;:":
+            grup.append(kini)
+            kini = []
+    if kini:
+        grup.append(kini)
+    return grup
+
+
 def buat_subtitle_ass(kata, mulai, total, path):
-    """Subtitle gaya 'per kata': satu kata besar muncul bergantian dengan efek membesar."""
+    """Subtitle 'karaoke': potongan kalimat pendek tampil tenang,
+    kata yang sedang diucapkan menyala kuning."""
     nama_font = "DejaVu Sans"
     if FONT_TEBAL and "Liberation" in FONT_TEBAL:
         nama_font = "Liberation Sans"
@@ -635,35 +740,35 @@ def buat_subtitle_ass(kata, mulai, total, path):
 ScriptType: v4.00+
 PlayResX: {W}
 PlayResY: {H}
-WrapStyle: 2
+WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Kata,{nama_font},118,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,2,0,1,9,4,2,40,40,{H - 1530},1
+Style: Sub,{nama_font},86,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,1,0,1,7,3,8,70,70,1400,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    kuning = r"{\c&H33D7FF&}"
+    putih = r"{\c&HFFFFFF&}"
     baris = []
-    for i, k in enumerate(kata):
-        awal = mulai[i]
-        akhir = mulai[i + 1] if i + 1 < len(kata) else min(awal + 1.2, total)
-        akhir = min(akhir, awal + 1.5)
-        teks = re.sub(r"[{}\\]", "", k).upper()
-        bersih = normal(k)
-        # kata panjang/penting diberi warna kuning, akhir kalimat seru/tanya merah muda
-        if k[-1:] in "!?":
-            warna = r"\c&H8080FF&"
-        elif len(bersih) >= 6:
-            warna = r"\c&H40D8FF&"
-        else:
-            warna = ""
-        # kata yang terlalu panjang dikecilkan supaya tidak terpotong layar
-        lebar = font(118).getlength(teks) + 2 * 9
-        ukuran = 118 if lebar <= 900 else max(int(118 * 900 / lebar), 60)
-        efek = (r"{\fs" + str(ukuran) +
-                r"\fscx70\fscy70\t(0,90,\fscx108\fscy108)\t(90,160,\fscx100\fscy100)" + warna + "}")
-        baris.append(f"Dialogue: 0,{ass_waktu(awal)},{ass_waktu(akhir)},Kata,,0,0,0,,{efek}{teks}")
+    for grup in kelompok_kata(kata):
+        akhir_grup = mulai[grup[-1] + 1] if grup[-1] + 1 < len(kata) else total
+        akhir_grup = min(akhir_grup, mulai[grup[-1]] + 1.6)
+        bersih = [re.sub(r"[{}\\]", "", kata[i]).upper() for i in grup]
+        for n, i in enumerate(grup):
+            awal = mulai[i]
+            akhir = mulai[grup[n + 1]] if n + 1 < len(grup) else akhir_grup
+            if akhir <= awal:
+                continue
+            potongan = []
+            for m, teks in enumerate(bersih):
+                potongan.append((kuning if m == n else putih) + teks)
+            # efek muncul halus hanya saat potongan kalimat baru tampil
+            masuk = r"{\fad(80,0)}" if n == 0 else ""
+            baris.append(
+                f"Dialogue: 0,{ass_waktu(awal)},{ass_waktu(akhir)},Sub,,0,0,0,,{masuk}" + " ".join(potongan)
+            )
     with open(path, "w", encoding="utf-8") as f:
         f.write(kepala + "\n".join(baris) + "\n")
 
