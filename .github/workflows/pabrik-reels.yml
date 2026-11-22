@@ -69,12 +69,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Pasang alat (ffmpeg, font, edge-tts)
+      - name: Pasang alat (ffmpeg, font, suara, penyelaras subtitle)
         if: steps.jatah.outputs.jalan == 'ya'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
-          pip install -q requests pillow edge-tts
+          pip install -q requests pillow edge-tts faster-whisper
 
       - name: Jalankan kantor virtual AI
         if: steps.jatah.outputs.jalan == 'ya'
@@ -88,7 +88,9 @@ jobs:
           NAMA_PAGE: ${{ vars.NAMA_PAGE }}
           MESIN_SUARA: ${{ vars.MESIN_SUARA }}
           SUARA_GEMINI: ${{ vars.SUARA_GEMINI }}
+          GAYA_SUARA: ${{ vars.GAYA_SUARA }}
           SUARA: ${{ vars.SUARA }}
+          MODEL_WHISPER: ${{ vars.MODEL_WHISPER }}
         run: python pabrik.py
 
       - name: Simpan hasil untuk dicek
