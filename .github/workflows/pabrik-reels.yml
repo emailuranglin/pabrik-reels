@@ -74,7 +74,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
-          pip install -q requests pillow edge-tts faster-whisper
+          pip install -q requests pillow numpy edge-tts faster-whisper
 
       - name: Jalankan kantor virtual AI
         if: steps.jatah.outputs.jalan == 'ya'
