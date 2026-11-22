@@ -300,9 +300,8 @@ def karyawan_ilustrator(prompt, path):
 # ---------------------------------------------------------------- Karyawan 5
 # Arahan gaya baca. Bawaan: KOSONG, karena model TTS Gemini terbaru sering ikut
 # membacakan arahan. Karakter suara cukup diatur lewat SUARA_GEMINI.
-GAYA_BACA = os.environ.get("GAYA_SUARA", "").strip()
-if GAYA_BACA and not GAYA_BACA.endswith(":"):
-    GAYA_BACA += ":"
+# Variabel GAYA_SUARA sengaja DIABAIKAN: arahan apa pun bisa ikut dibacakan narator.
+GAYA_BACA = ""
 
 
 def perkiraan_detik(teks):
