@@ -295,12 +295,10 @@ def karyawan_ilustrator(prompt, path):
 
 
 # ---------------------------------------------------------------- Karyawan 5
-# Arahan gaya dibuat SINGKAT dengan pola resmi "Say ...:" supaya tidak ikut dibacakan.
-GAYA_BACA = (
-    os.environ.get("GAYA_SUARA", "").strip()
-    or "Say in a warm, gentle, emotional storyteller voice, slightly slow, in Indonesian:"
-)
-if not GAYA_BACA.endswith(":"):
+# Arahan gaya baca. Bawaan: KOSONG, karena model TTS Gemini terbaru sering ikut
+# membacakan arahan. Karakter suara cukup diatur lewat SUARA_GEMINI.
+GAYA_BACA = os.environ.get("GAYA_SUARA", "").strip()
+if GAYA_BACA and not GAYA_BACA.endswith(":"):
     GAYA_BACA += ":"
 
 
@@ -312,7 +310,8 @@ def perkiraan_detik(teks):
 def tts_gemini(teks, path_wav):
     """Suara ekspresif dari Gemini TTS (gratis, kuota harian terbatas). True jika berhasil."""
     # percobaan 1: dengan arahan gaya; percobaan 2: teks polos (kalau arahan ikut terbaca)
-    for pakai_gaya in (True, False):
+    pilihan = (True, False) if GAYA_BACA else (False,)
+    for pakai_gaya in pilihan:
         hasil = _tts_gemini_sekali(teks, path_wav, pakai_gaya)
         if hasil == "ok":
             return True
