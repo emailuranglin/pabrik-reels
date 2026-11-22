@@ -17,6 +17,7 @@ Mode (diatur dari GitHub Actions):
 
 import asyncio
 import base64
+import difflib
 import glob
 import json
 import math
@@ -61,6 +62,7 @@ MODEL_GEMINI = [
     ).split(",")
     if m.strip()
 ]
+MODEL_WHISPER = os.environ.get("MODEL_WHISPER", "").strip() or "base"
 MODEL_GAMBAR = os.environ.get("MODEL_GAMBAR", "@cf/black-forest-labs/flux-1-schnell")
 
 FOLDER = "hasil"
@@ -271,7 +273,12 @@ def karyawan_ilustrator(prompt, path):
 
 # ---------------------------------------------------------------- Karyawan 5
 # Arahan gaya dibuat SINGKAT dengan pola resmi "Say ...:" supaya tidak ikut dibacakan.
-GAYA_BACA = "Say in a warm, gentle, emotional storyteller voice, slightly slow, in Indonesian:"
+GAYA_BACA = (
+    os.environ.get("GAYA_SUARA", "").strip()
+    or "Say in a warm, gentle, emotional storyteller voice, slightly slow, in Indonesian:"
+)
+if not GAYA_BACA.endswith(":"):
+    GAYA_BACA += ":"
 
 
 def perkiraan_detik(teks):
@@ -438,30 +445,17 @@ def tulis_tengah(draw, teks, y, fnt, lebar_maks_karakter, warna, bayangan=True, 
     return y
 
 
-def buat_latar(judul, kalimat, warna, path):
-    """Latar 1080x1920: judul di atas, kotak kosong untuk gambar, subtitle di bawah."""
+def buat_latar(judul, warna, path):
+    """Latar 1080x1920: judul di atas, bingkai gambar di tengah. Subtitle ditempel belakangan."""
     img = Image.new("RGB", (W, H), warna)
     d = ImageDraw.Draw(img)
-    # judul
     tulis_tengah(d, judul.upper(), 120, font(54), 28, (255, 230, 150))
-    # bingkai gambar
     x0 = (W - UKURAN_GAMBAR) // 2
-    y0 = 380
+    y0 = 330
     d.rounded_rectangle(
         [x0 - 8, y0 - 8, x0 + UKURAN_GAMBAR + 8, y0 + UKURAN_GAMBAR + 8],
         radius=24, fill=(255, 255, 255),
     )
-    # subtitle
-    fnt = font(58)
-    baris = textwrap.wrap(kalimat, width=26)
-    tinggi_teks = len(baris) * int(fnt.size * 1.25)
-    y_sub = 1440
-    pad = 28
-    d.rounded_rectangle(
-        [50, y_sub - pad, W - 50, y_sub + tinggi_teks + pad - 10],
-        radius=28, fill=(0, 0, 0),
-    )
-    tulis_tengah(d, kalimat, y_sub, fnt, 26, (255, 255, 255), bayangan=False)
     if NAMA_PAGE:
         tulis_tengah(d, NAMA_PAGE, H - 110, font(34), 40, (220, 220, 220), bayangan=False)
     img.save(path)
@@ -514,53 +508,190 @@ def rakit_klip(latar, gambar, frame, pos, out):
     )
 
 
-def bobot(kalimat):
-    """Perkiraan lama kalimat dibacakan: jumlah huruf + jeda tanda baca."""
-    jeda = kalimat.count(",") * 6 + 14
-    return len(kalimat) + jeda
+def bobot(kata):
+    """Perkiraan lama sebuah kata dibacakan: jumlah huruf + jeda tanda baca."""
+    jeda = 0
+    if kata.endswith(","):
+        jeda = 5
+    elif kata[-1:] in ".!?":
+        jeda = 10
+    return len(kata) + 3 + jeda
+
+
+def normal(kata):
+    return re.sub(r"[^a-z0-9]", "", kata.lower())
+
+
+def waktu_kata_whisper(kata_naskah, suara):
+    """Cari waktu mulai tiap kata dengan mendengarkan ulang narasinya (faster-whisper).
+    Mengembalikan list waktu mulai (detik) sepanjang kata_naskah, atau None jika gagal."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        log("  faster-whisper tidak terpasang, waktu subtitle pakai perkiraan.")
+        return None
+    try:
+        log(f"  Menyelaraskan subtitle dengan suara (whisper {MODEL_WHISPER})...")
+        model = WhisperModel(MODEL_WHISPER, device="cpu", compute_type="int8")
+        segmen, _ = model.transcribe(suara, language="id", word_timestamps=True, beam_size=1)
+        dengar = [(normal(w.word), w.start) for s in segmen for w in (s.words or [])]
+    except Exception as e:  # noqa: BLE001
+        log(f"  Whisper gagal ({e}), waktu subtitle pakai perkiraan.")
+        return None
+    dengar = [(k, t) for k, t in dengar if k]
+    if len(dengar) < len(kata_naskah) * 0.5:
+        log("  Whisper hanya menangkap sedikit kata, waktu subtitle pakai perkiraan.")
+        return None
+    a = [normal(k) for k in kata_naskah]
+    b = [k for k, _ in dengar]
+    waktu = [None] * len(a)
+    cocok = 0
+    for blok in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_matching_blocks():
+        for n in range(blok.size):
+            waktu[blok.a + n] = dengar[blok.b + n][1]
+            cocok += 1
+    log(f"  {cocok}/{len(a)} kata cocok dengan suara.")
+    if cocok < len(a) * 0.4:
+        return None
+    return waktu
+
+
+def isi_waktu_kosong(kata, waktu, total):
+    """Kata yang tidak tertangkap whisper diberi waktu di antara tetangganya (sesuai panjang kata)."""
+    n = len(kata)
+    waktu = list(waktu)
+    if waktu[0] is None:
+        waktu[0] = 0.0
+    i = 0
+    while i < n:
+        if waktu[i] is not None:
+            i += 1
+            continue
+        mulai = i
+        while i < n and waktu[i] is None:
+            i += 1
+        kiri = waktu[mulai - 1]
+        kanan = waktu[i] if i < n else total - 0.5
+        b = [bobot(k) for k in kata[mulai - 1:i]]
+        jumlah = sum(b)
+        t = kiri
+        for j, idx in enumerate(range(mulai, i)):
+            t += (kanan - kiri) * b[j] / jumlah
+            waktu[idx] = t
+    # pastikan selalu maju
+    for i in range(1, n):
+        if waktu[i] <= waktu[i - 1]:
+            waktu[i] = waktu[i - 1] + 0.05
+    return waktu
+
+
+def waktu_kata_perkiraan(kata, total):
+    b = [bobot(k) for k in kata]
+    jumlah = sum(b)
+    waktu, t = [], 0.0
+    for x in b:
+        waktu.append(t)
+        t += total * x / jumlah
+    return waktu
+
+
+def ass_waktu(detik):
+    detik = max(detik, 0)
+    j = int(detik // 3600)
+    m = int(detik % 3600 // 60)
+    d = detik % 60
+    return f"{j}:{m:02d}:{d:05.2f}"
+
+
+def buat_subtitle_ass(kata, mulai, total, path):
+    """Subtitle gaya 'per kata': satu kata besar muncul bergantian dengan efek membesar."""
+    nama_font = "DejaVu Sans"
+    if FONT_TEBAL and "Liberation" in FONT_TEBAL:
+        nama_font = "Liberation Sans"
+    kepala = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {W}
+PlayResY: {H}
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Kata,{nama_font},118,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,2,0,1,9,4,2,40,40,{H - 1530},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    baris = []
+    for i, k in enumerate(kata):
+        awal = mulai[i]
+        akhir = mulai[i + 1] if i + 1 < len(kata) else min(awal + 1.2, total)
+        akhir = min(akhir, awal + 1.5)
+        teks = re.sub(r"[{}\\]", "", k).upper()
+        bersih = normal(k)
+        # kata panjang/penting diberi warna kuning, akhir kalimat seru/tanya merah muda
+        if k[-1:] in "!?":
+            warna = r"\c&H8080FF&"
+        elif len(bersih) >= 6:
+            warna = r"\c&H40D8FF&"
+        else:
+            warna = ""
+        # kata yang terlalu panjang dikecilkan supaya tidak terpotong layar
+        lebar = font(118).getlength(teks) + 2 * 9
+        ukuran = 118 if lebar <= 900 else max(int(118 * 900 / lebar), 60)
+        efek = (r"{\fs" + str(ukuran) +
+                r"\fscx70\fscy70\t(0,90,\fscx108\fscy108)\t(90,160,\fscx100\fscy100)" + warna + "}")
+        baris.append(f"Dialogue: 0,{ass_waktu(awal)},{ass_waktu(akhir)},Kata,,0,0,0,,{efek}{teks}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(kepala + "\n".join(baris) + "\n")
 
 
 def karyawan_editor(naskah):
     log("\n[4-6] ILUSTRATOR + NARATOR + EDITOR: membuat video...")
     os.makedirs(FOLDER, exist_ok=True)
 
-    # 1. pecah naskah jadi kalimat-kalimat subtitle
-    potongan = []  # (nomor_adegan, kalimat)
+    # 1. susun daftar kata beserta nomor adegannya
+    kata, adegan_kata = [], []
     for i, adegan in enumerate(naskah["adegan"], start=1):
-        for kalimat in pecah_kalimat(adegan["narasi"]):
-            potongan.append((i, kalimat))
+        for k in adegan["narasi"].split():
+            kata.append(k)
+            adegan_kata.append(i)
 
     # 2. suara: seluruh kisah dibaca sekali jalan
     suara = f"{FOLDER}/narasi.wav"
-    karyawan_narator(" ".join(k for _, k in potongan), suara)
-    total = durasi(suara) + 0.8  # sedikit jeda di akhir
-    total_frame = math.ceil(total * FPS)
+    karyawan_narator(" ".join(kata), suara)
+    lama_suara = durasi(suara)
+    total = lama_suara + 0.8
 
-    # 3. bagi waktu subtitle sesuai panjang kalimat
-    bobot_total = sum(bobot(k) for _, k in potongan)
-    batas, kumulatif = [0], 0
-    for _, k in potongan:
-        kumulatif += bobot(k)
-        batas.append(round(total_frame * kumulatif / bobot_total))
+    # 3. waktu tiap kata (didengarkan ulang, atau diperkirakan)
+    waktu = waktu_kata_whisper(kata, suara)
+    if waktu:
+        mulai = isi_waktu_kosong(kata, waktu, lama_suara)
+    else:
+        mulai = waktu_kata_perkiraan(kata, lama_suara)
 
-    # 4. gambar tiap adegan + klip tiap kalimat
-    gambar_adegan = {}
+    # 4. satu klip per adegan, panjangnya mengikuti kapan adegan berikutnya mulai dibacakan
+    jumlah_adegan = len(naskah["adegan"])
+    awal_adegan = {}
+    for idx, a in enumerate(adegan_kata):
+        awal_adegan.setdefault(a, mulai[idx])
+    awal_adegan[1] = 0.0
+    batas = [awal_adegan.get(a, 0.0) for a in range(1, jumlah_adegan + 1)] + [total]
+    frame_batas = [round(t * FPS) for t in batas]
+
     klip = []
-    for n, (i, kalimat) in enumerate(potongan):
-        if i not in gambar_adegan:
-            log(f"  Adegan {i}/{len(naskah['adegan'])}: membuat gambar...")
-            path = f"{FOLDER}/gambar_{i}.jpg"
-            karyawan_ilustrator(naskah["adegan"][i - 1]["prompt_gambar"], path)
-            gambar_adegan[i] = path
-        frame = max(batas[n + 1] - batas[n], 1)
-        warna = WARNA_LATAR[(i - 1) % len(WARNA_LATAR)]
-        latar = f"{FOLDER}/latar_{n:03d}.png"
-        pos = buat_latar(naskah["judul"], kalimat, warna, latar)
-        out = f"{FOLDER}/klip_{n:03d}.mp4"
-        rakit_klip(latar, gambar_adegan[i], frame, pos, out)
+    for a in range(1, jumlah_adegan + 1):
+        log(f"  Adegan {a}/{jumlah_adegan}: membuat gambar...")
+        gambar = f"{FOLDER}/gambar_{a}.jpg"
+        karyawan_ilustrator(naskah["adegan"][a - 1]["prompt_gambar"], gambar)
+        warna = WARNA_LATAR[(a - 1) % len(WARNA_LATAR)]
+        latar = f"{FOLDER}/latar_{a}.png"
+        pos = buat_latar(naskah["judul"], warna, latar)
+        frame = max(frame_batas[a] - frame_batas[a - 1], 1)
+        out = f"{FOLDER}/klip_{a:03d}.mp4"
+        rakit_klip(latar, gambar, frame, pos, out)
         klip.append(out)
 
-    # 5. sambung semua klip + tempel suara
+    # 5. sambung klip, tempel subtitle per kata + suara
     daftar = f"{FOLDER}/daftar.txt"
     with open(daftar, "w") as f:
         for k in klip:
@@ -571,13 +702,21 @@ def karyawan_editor(naskah):
          "-i", daftar, "-c", "copy", gambar_saja],
         check=True,
     )
+    sub = f"{FOLDER}/subtitle.ass"
+    buat_subtitle_ass(kata, mulai, total, sub)
     hasil = f"{FOLDER}/video_final.mp4"
+    filter_sub = "subtitles=subtitle.ass"
+    if FONT_TEBAL:
+        filter_sub += f":fontsdir={os.path.dirname(FONT_TEBAL)}"
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", gambar_saja, "-i", suara,
-         "-filter_complex", "[1:a]apad[a]", "-map", "0:v", "-map", "[a]",
-         "-c:v", "copy", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "160k",
-         "-shortest", "-movflags", "+faststart", hasil],
-        check=True,
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-i", os.path.basename(gambar_saja), "-i", os.path.basename(suara),
+         "-filter_complex", f"[0:v]{filter_sub}[v];[1:a]apad=pad_dur=1[a]",
+         "-map", "[v]", "-map", "[a]",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "160k",
+         "-t", f"{durasi(gambar_saja):.2f}", "-movflags", "+faststart", os.path.basename(hasil)],
+        check=True, cwd=FOLDER,
     )
     log(f"  Video jadi: {hasil} ({durasi(hasil):.1f} detik)")
     return hasil
