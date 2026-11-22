@@ -270,23 +270,36 @@ def karyawan_ilustrator(prompt, path):
 
 
 # ---------------------------------------------------------------- Karyawan 5
-GAYA_BACA = (
-    "Bacakan kisah berikut dalam bahasa Indonesia seperti pendongeng yang hangat dan tulus. "
-    "Tempo agak pelan, suara lembut dan penuh perasaan, sedikit haru di bagian sedih, "
-    "beri jeda alami di antara kalimat, dan tekankan kalimat twist di akhir. "
-    "Jangan membacakan instruksi ini, hanya kisahnya:"
-)
+# Arahan gaya dibuat SINGKAT dengan pola resmi "Say ...:" supaya tidak ikut dibacakan.
+GAYA_BACA = "Say in a warm, gentle, emotional storyteller voice, slightly slow, in Indonesian:"
+
+
+def perkiraan_detik(teks):
+    """Perkiraan lama narasi dibaca pelan: sekitar 2,2 kata per detik."""
+    return len(teks.split()) / 2.2
 
 
 def tts_gemini(teks, path_wav):
     """Suara ekspresif dari Gemini TTS (gratis, kuota harian terbatas). True jika berhasil."""
+    # percobaan 1: dengan arahan gaya; percobaan 2: teks polos (kalau arahan ikut terbaca)
+    for pakai_gaya in (True, False):
+        hasil = _tts_gemini_sekali(teks, path_wav, pakai_gaya)
+        if hasil == "ok":
+            return True
+        if hasil != "kepanjangan":
+            return False
+    return False
+
+
+def _tts_gemini_sekali(teks, path_wav, pakai_gaya):
+    isi = f"{GAYA_BACA}\n{teks}" if pakai_gaya else teks
     for model in MODEL_SUARA:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model}:generateContent?key={GEMINI_KEY}"
         )
         body = {
-            "contents": [{"parts": [{"text": f"{GAYA_BACA}\n\n{teks}"}]}],
+            "contents": [{"parts": [{"text": isi}]}],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
@@ -321,9 +334,15 @@ def tts_gemini(teks, path_wav):
                     check=True,
                 )
                 os.remove(mentah)
-                if durasi(path_wav) > 10:
+                lama = durasi(path_wav)
+                batas_atas = perkiraan_detik(teks) * 1.25 + 3
+                if lama > batas_atas:
+                    log(f"  Audio {lama:.0f} dtk, terlalu panjang (maks {batas_atas:.0f}): "
+                        "kemungkinan arahan ikut terbaca. Ulangi tanpa arahan gaya.")
+                    return "kepanjangan"
+                if lama > 10:
                     log(f"  Suara dari Gemini TTS ({model}, suara {SUARA_GEMINI}).")
-                    return True
+                    return "ok"
                 log("  Audio Gemini terlalu pendek, coba lagi...")
                 continue
             if r.status_code == 429:
@@ -334,7 +353,7 @@ def tts_gemini(teks, path_wav):
                 continue
             log(f"  Gemini TTS ({model}) tidak tersedia: {r.status_code}")
             break
-    return False
+    return "gagal"
 
 
 async def _tts_edge(teks, path):
