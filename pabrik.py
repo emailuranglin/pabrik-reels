@@ -268,11 +268,18 @@ Beri lolos=true hanya jika skor >= 7 dan tidak ada masalah keamanan."""
 
 
 # ---------------------------------------------------------------- Karyawan 4
-def _minta_gambar(prompt, path):
+GAYA_GAMBAR_CADANGAN = (
+    "cute minimalist stick figure doodle, black outline drawing, simple flat 2D cartoon, "
+    "plain light background, no text"
+)
+
+
+def _minta_gambar(prompt, path, gaya=None):
     """Satu permintaan ke Cloudflare. Mengembalikan 'ok', 'tolak' (dianggap tidak aman) atau 'gagal'."""
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/run/{MODEL_GAMBAR}"
-    body = {"prompt": f"{prompt}. Style: {GAYA_GAMBAR}", "steps": 4,
-            "seed": random.randint(1, 10_000_000)}
+    gaya = GAYA_GAMBAR if gaya is None else gaya
+    teks = f"{prompt}. Style: {gaya}" if gaya else prompt
+    body = {"prompt": teks[:2000], "steps": 6}
     try:
         r = requests.post(url, headers={"Authorization": f"Bearer {CF_TOKEN}"}, json=body, timeout=120)
     except requests.RequestException as e:
@@ -289,6 +296,7 @@ def _minta_gambar(prompt, path):
     if r.status_code in (401, 403):
         sys.exit("[GAGAL] Token/Account ID Cloudflare salah, atau kuota gratis habis hari ini.")
     if "NSFW" in r.text or "3030" in r.text or "8007" in r.text:
+        log(f"  Ditolak filter: {r.text[:160]}")
         return "tolak"
     log(f"  Cloudflare error {r.status_code}: {r.text[:200]}")
     return "gagal"
@@ -308,20 +316,23 @@ def gambar_cadangan(path):
 
 
 def karyawan_ilustrator(prompt, path):
-    # 1) prompt asli, 2) prompt asli seed lain, 3) prompt aman yang lebih umum
     aman = ("a simple stickman standing in a cozy Indonesian home, thoughtful and emotional mood, "
             "family drama scene")
-    for n, p in enumerate([prompt, prompt, aman]):
-        hasil = _minta_gambar(p, path)
+    percobaan = [
+        (prompt, GAYA_GAMBAR, "gaya utama"),
+        (prompt, GAYA_GAMBAR_CADANGAN, "gaya cadangan"),
+        (aman, GAYA_GAMBAR_CADANGAN, "adegan umum"),
+        (prompt, "", "tanpa gaya"),
+    ]
+    for p, gaya, label in percobaan:
+        hasil = _minta_gambar(p, path, gaya)
         if hasil == "ok":
-            if n == 2:
-                log("  (memakai gambar versi umum)")
+            if label != "gaya utama":
+                log(f"  (gambar dibuat dengan {label})")
             return
-        if hasil == "tolak":
-            log("  Prompt gambar dianggap sensitif oleh filter Cloudflare, coba versi lain...")
-        else:
-            time.sleep(6)
-    log("  Gambar tidak berhasil dibuat, memakai gambar stickman cadangan.")
+        if hasil == "gagal":
+            time.sleep(5)
+    log("  [PERINGATAN] Semua percobaan gambar gagal, memakai gambar stickman cadangan.")
     gambar_cadangan(path)
 
 
