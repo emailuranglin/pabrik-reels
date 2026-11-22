@@ -1,0 +1,73 @@
+name: Pabrik Reels
+
+on:
+  # Tombol manual "Run workflow" di tab Actions
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "uji = buat video saja (tidak diposting), posting = langsung posting ke Page"
+        required: true
+        default: "uji"
+        type: choice
+        options:
+          - uji
+          - posting
+  # JADWAL OTOMATIS: belum aktif. Nanti di langkah 7 kita aktifkan.
+  # schedule:
+  #   - cron: "0 5,12 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  buat-reels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Ambil isi gudang
+        uses: actions/checkout@v4
+
+      - name: Siapkan Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pasang alat (ffmpeg, font, edge-tts)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          pip install -q requests pillow edge-tts
+
+      - name: Jalankan kantor virtual AI
+        env:
+          MODE: ${{ github.event.inputs.mode || 'posting' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          NAMA_PAGE: ${{ vars.NAMA_PAGE }}
+        run: python pabrik.py
+
+      - name: Simpan hasil untuk dicek
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasil-reels
+          path: |
+            hasil/video_final.mp4
+            hasil/caption.txt
+            hasil/naskah.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Catat riwayat judul (supaya tidak mengulang kisah)
+        if: success()
+        run: |
+          if [ -f riwayat.json ] && [ -n "$(git status --porcelain riwayat.json)" ]; then
+            git config user.name "pabrik-reels-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add riwayat.json
+            git commit -m "Catat riwayat Reels"
+            git push
+          fi
