@@ -5,7 +5,7 @@ Karyawan AI:
   1. Perencana  (Gemini)          -> memilih ide kisah baru
   2. Penulis    (Gemini)          -> menulis naskah, adegan, caption
   3. Pemeriksa  (Gemini)          -> QC naskah, minta revisi kalau perlu
-  4. Ilustrator (Cloudflare FLUX) -> membuat gambar siluet tiap adegan
+  4. Ilustrator (Cloudflare FLUX) -> membuat gambar stickman tiap adegan
   5. Narator    (Gemini TTS, cadangan edge-tts) -> membacakan kisah
   6. Editor     (ffmpeg)          -> merakit video vertikal + subtitle
   7. Pengunggah (Facebook API)    -> memposting Reels ke Page
@@ -73,9 +73,10 @@ FPS = 30
 UKURAN_GAMBAR = 1000        # gambar ilustrasi persegi di tengah layar
 
 GAYA_GAMBAR = (
-    "minimalist flat 2D illustration, simple black silhouette characters without faces, "
-    "clean simple shapes, soft plain pastel background, warm emotional lighting, "
-    "Indonesian family home setting, no text, no letters, no watermark"
+    "simple stickman cartoon, stick figure characters drawn with thick black lines, "
+    "round white heads with simple dot eyes and small expressive mouth, thin line arms and legs, "
+    "minimalist flat 2D doodle style, clean white or soft pastel plain background, "
+    "few simple props, no realistic people, no text, no letters, no watermark"
 )
 
 WARNA_LATAR = [
@@ -233,7 +234,9 @@ Aturan naskah:
 - Bagi menjadi 5 atau 6 adegan. Tiap adegan 1-3 kalimat pendek. Bahasa lisan sehari-hari, mudah dibacakan.
 - Adegan terakhir berisi twist + pelajaran, lalu ajakan ringan berkomentar (contoh: "Kalau kamu jadi dia, apa yang akan kamu lakukan?").
 - Untuk tiap adegan, tulis prompt_gambar dalam BAHASA INGGRIS: deskripsi visual singkat (siapa, sedang apa, di mana),
-  tokoh berupa siluet hitam tanpa wajah. Jangan menyebut teks/tulisan di gambar.
+  semua tokoh berupa STICKMAN (stick figure) sederhana. Bedakan tokoh dengan ciri sederhana yang konsisten
+  di semua adegan (contoh: "the father stickman wears a small cap", "the mother stickman has a hijab").
+  Sebutkan ekspresi/emosi tokoh. Jangan menyebut teks/tulisan di gambar.
 - Caption Facebook: 2-3 kalimat yang memancing rasa penasaran + pertanyaan untuk komentar. Jangan clickbait palsu.
 - 4-6 hashtag bahasa Indonesia yang relevan.
 
@@ -461,7 +464,9 @@ def rapikan_suara(path_wav, jumlah_kata):
         while j >= 0 and not bunyi[j]:
             jeda += 1
             j -= 1
-        if panjang_ekor < 0.45 and jeda * 0.02 >= 0.1 and j > 0:
+        ekor_keras = rms[mulai_ekor:ujung].mean() > 2.5 * np.median(rms[:ujung][bunyi[:ujung]])
+        if (panjang_ekor < 0.3 and jeda * 0.02 >= 0.15 and j > 0
+                and (ekor_keras or panjang_ekor < 0.12)):
             log(f"  Membuang bunyi aneh {panjang_ekor:.2f} dtk di ujung rekaman.")
             akhir = j + 1
         else:
@@ -720,6 +725,20 @@ def periksa_dan_selaraskan(kata, teks_narasi, suara):
         if lap["ekstra_tengah"] >= 6 and putaran == 0:
             log(f"  Ada {lap['ekstra_tengah']} kata asing di tengah narasi. "
                 "Suara dibuat ulang tanpa arahan gaya.")
+            if tts_gemini_polos(teks_narasi, suara) or tts_edge(teks_narasi, suara):
+                rapikan_suara(suara, len(kata))
+                continue
+        # Ucapan asing hanya dibuang kalau kata pertama/terakhir naskah memang sudah terdengar.
+        # Kalau tidak, bisa jadi whisper cuma salah dengar kata naskah itu sendiri.
+        if all(w is None for w in waktu[:2]):
+            lap["ekstra_awal"] = 0
+        if all(w is None for w in waktu[-2:]):
+            lap["ekstra_akhir"] = 0
+        # Akhir cerita tidak terdengar sama sekali? Mesin suara mungkin memotong narasi.
+        hilang_akhir = all(w is None for w in waktu[-4:]) and lap["ekstra_akhir"] == 0
+        if hilang_akhir and putaran < 2:
+            log("  Kalimat terakhir naskah tidak terdengar: narasi kemungkinan terpotong. "
+                "Suara dibuat ulang.")
             if tts_gemini_polos(teks_narasi, suara) or tts_edge(teks_narasi, suara):
                 rapikan_suara(suara, len(kata))
                 continue
