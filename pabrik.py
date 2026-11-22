@@ -6,7 +6,7 @@ Karyawan AI:
   2. Penulis    (Gemini)          -> menulis naskah, adegan, caption
   3. Pemeriksa  (Gemini)          -> QC naskah, minta revisi kalau perlu
   4. Ilustrator (Cloudflare FLUX) -> membuat gambar siluet tiap adegan
-  5. Narator    (edge-tts)        -> membuat suara narasi
+  5. Narator    (Gemini TTS, cadangan edge-tts) -> membacakan kisah
   6. Editor     (ffmpeg)          -> merakit video vertikal + subtitle
   7. Pengunggah (Facebook API)    -> memposting Reels ke Page
 
@@ -40,7 +40,17 @@ FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
 FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "").strip()
 
 NAMA_PAGE = os.environ.get("NAMA_PAGE", "").strip()
-SUARA = os.environ.get("SUARA", "id-ID-GadisNeural")  # atau id-ID-ArdiNeural (pria)
+# Mesin suara: auto = coba Gemini TTS (lebih ekspresif), kalau gagal pakai edge-tts
+MESIN_SUARA = os.environ.get("MESIN_SUARA", "auto").strip().lower() or "auto"
+SUARA_GEMINI = os.environ.get("SUARA_GEMINI", "").strip() or "Sulafat"  # suara hangat
+MODEL_SUARA = [
+    m.strip()
+    for m in (os.environ.get("MODEL_SUARA", "").strip() or
+              "gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts"
+              ).split(",")
+    if m.strip()
+]
+SUARA = os.environ.get("SUARA", "").strip() or "id-ID-GadisNeural"  # cadangan edge-tts
 
 # Model Gemini dicoba berurutan; yang pertama berhasil dipakai.
 MODEL_GEMINI = [
@@ -260,21 +270,107 @@ def karyawan_ilustrator(prompt, path):
 
 
 # ---------------------------------------------------------------- Karyawan 5
-async def _tts(teks, path):
+GAYA_BACA = (
+    "Bacakan kisah berikut dalam bahasa Indonesia seperti pendongeng yang hangat dan tulus. "
+    "Tempo agak pelan, suara lembut dan penuh perasaan, sedikit haru di bagian sedih, "
+    "beri jeda alami di antara kalimat, dan tekankan kalimat twist di akhir. "
+    "Jangan membacakan instruksi ini, hanya kisahnya:"
+)
+
+
+def tts_gemini(teks, path_wav):
+    """Suara ekspresif dari Gemini TTS (gratis, kuota harian terbatas). True jika berhasil."""
+    for model in MODEL_SUARA:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={GEMINI_KEY}"
+        )
+        body = {
+            "contents": [{"parts": [{"text": f"{GAYA_BACA}\n\n{teks}"}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": SUARA_GEMINI}}
+                },
+            },
+        }
+        for percobaan in range(2):
+            try:
+                r = requests.post(url, json=body, timeout=300)
+            except requests.RequestException as e:
+                log(f"  Gemini TTS koneksi gagal: {e}")
+                time.sleep(5)
+                continue
+            if r.status_code == 200:
+                try:
+                    bagian = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+                except (KeyError, IndexError):
+                    log(f"  Gemini TTS ({model}) tidak mengirim audio.")
+                    break
+                pcm = base64.b64decode(bagian["data"])
+                rate = 24000
+                cocok = re.search(r"rate=(\d+)", bagian.get("mimeType", ""))
+                if cocok:
+                    rate = int(cocok.group(1))
+                mentah = path_wav + ".pcm"
+                with open(mentah, "wb") as f:
+                    f.write(pcm)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-f", "s16le", "-ar", str(rate),
+                     "-ac", "1", "-i", mentah, path_wav],
+                    check=True,
+                )
+                os.remove(mentah)
+                if durasi(path_wav) > 10:
+                    log(f"  Suara dari Gemini TTS ({model}, suara {SUARA_GEMINI}).")
+                    return True
+                log("  Audio Gemini terlalu pendek, coba lagi...")
+                continue
+            if r.status_code == 429:
+                log(f"  Kuota Gemini TTS ({model}) habis/sibuk.")
+                break
+            if r.status_code in (500, 503):
+                time.sleep(15)
+                continue
+            log(f"  Gemini TTS ({model}) tidak tersedia: {r.status_code}")
+            break
+    return False
+
+
+async def _tts_edge(teks, path):
     import edge_tts
 
-    await edge_tts.Communicate(teks, SUARA, rate="+4%").save(path)
+    await edge_tts.Communicate(teks, SUARA, rate="-6%", pitch="-2Hz").save(path)
 
 
-def karyawan_narator(teks, path):
+def tts_edge(teks, path_wav):
+    mp3 = path_wav.replace(".wav", "_edge.mp3")
     for percobaan in range(3):
         try:
-            asyncio.run(_tts(teks, path))
-            if os.path.getsize(path) > 1000:
-                return
+            asyncio.run(_tts_edge(teks, mp3))
+            if os.path.getsize(mp3) > 1000:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3, "-ar", "24000",
+                     "-ac", "1", path_wav],
+                    check=True,
+                )
+                log(f"  Suara dari edge-tts ({SUARA}).")
+                return True
         except Exception as e:  # noqa: BLE001
-            log(f"  TTS gagal ({e}), coba lagi...")
+            log(f"  edge-tts gagal ({e}), coba lagi...")
             time.sleep(4)
+    return False
+
+
+def karyawan_narator(teks, path_wav):
+    """Membacakan SELURUH kisah sekaligus supaya intonasinya mengalir alami."""
+    log("  Narator: membacakan kisah...")
+    if MESIN_SUARA in ("auto", "gemini") and tts_gemini(teks, path_wav):
+        return
+    if MESIN_SUARA == "gemini":
+        log("  Gemini TTS gagal, pakai cadangan edge-tts.")
+    if tts_edge(teks, path_wav):
+        return
     sys.exit("[GAGAL] Suara narasi tidak berhasil dibuat.")
 
 
@@ -377,61 +473,91 @@ def pecah_kalimat(teks):
     return hasil
 
 
-def rakit_klip(latar, gambar, suara, pos, out):
-    """Satu klip: latar + gambar yang pelan-pelan zoom + suara."""
-    dur = durasi(suara) + 0.35
-    frame = math.ceil(dur * FPS)
+def rakit_klip(latar, gambar, frame, pos, out):
+    """Satu klip tanpa suara: latar + gambar yang pelan-pelan zoom, panjang = frame."""
     x0, y0 = pos
     s = UKURAN_GAMBAR
-    zoom = (
+    filt = (
         f"[1:v]scale={s * 2}:{s * 2},"
         f"zoompan=z='min(zoom+0.0007,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
         f":d={frame}:s={s}x{s}:fps={FPS}[z];"
-        f"[0:v][z]overlay={x0}:{y0}:shortest=1,format=yuv420p[v];"
-        f"[2:a]apad=pad_dur=0.35[a]"
+        f"[0:v][z]overlay={x0}:{y0},format=yuv420p[v]"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",
          "-loop", "1", "-framerate", str(FPS), "-i", latar,
          "-i", gambar,
-         "-i", suara,
-         "-filter_complex", zoom,
-         "-map", "[v]", "-map", "[a]",
-         "-t", f"{dur:.2f}",
+         "-filter_complex", filt, "-map", "[v]",
+         "-frames:v", str(frame),
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", str(FPS),
-         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
          out],
         check=True,
     )
 
 
+def bobot(kalimat):
+    """Perkiraan lama kalimat dibacakan: jumlah huruf + jeda tanda baca."""
+    jeda = kalimat.count(",") * 6 + 14
+    return len(kalimat) + jeda
+
+
 def karyawan_editor(naskah):
     log("\n[4-6] ILUSTRATOR + NARATOR + EDITOR: membuat video...")
     os.makedirs(FOLDER, exist_ok=True)
-    klip = []
-    nomor = 0
+
+    # 1. pecah naskah jadi kalimat-kalimat subtitle
+    potongan = []  # (nomor_adegan, kalimat)
     for i, adegan in enumerate(naskah["adegan"], start=1):
-        log(f"  Adegan {i}/{len(naskah['adegan'])}: membuat gambar...")
-        gambar = f"{FOLDER}/gambar_{i}.jpg"
-        karyawan_ilustrator(adegan["prompt_gambar"], gambar)
-        warna = WARNA_LATAR[(i - 1) % len(WARNA_LATAR)]
         for kalimat in pecah_kalimat(adegan["narasi"]):
-            nomor += 1
-            suara = f"{FOLDER}/suara_{nomor}.mp3"
-            karyawan_narator(kalimat, suara)
-            latar = f"{FOLDER}/latar_{nomor}.png"
-            pos = buat_latar(naskah["judul"], kalimat, warna, latar)
-            out = f"{FOLDER}/klip_{nomor:03d}.mp4"
-            rakit_klip(latar, gambar, suara, pos, out)
-            klip.append(out)
+            potongan.append((i, kalimat))
+
+    # 2. suara: seluruh kisah dibaca sekali jalan
+    suara = f"{FOLDER}/narasi.wav"
+    karyawan_narator(" ".join(k for _, k in potongan), suara)
+    total = durasi(suara) + 0.8  # sedikit jeda di akhir
+    total_frame = math.ceil(total * FPS)
+
+    # 3. bagi waktu subtitle sesuai panjang kalimat
+    bobot_total = sum(bobot(k) for _, k in potongan)
+    batas, kumulatif = [0], 0
+    for _, k in potongan:
+        kumulatif += bobot(k)
+        batas.append(round(total_frame * kumulatif / bobot_total))
+
+    # 4. gambar tiap adegan + klip tiap kalimat
+    gambar_adegan = {}
+    klip = []
+    for n, (i, kalimat) in enumerate(potongan):
+        if i not in gambar_adegan:
+            log(f"  Adegan {i}/{len(naskah['adegan'])}: membuat gambar...")
+            path = f"{FOLDER}/gambar_{i}.jpg"
+            karyawan_ilustrator(naskah["adegan"][i - 1]["prompt_gambar"], path)
+            gambar_adegan[i] = path
+        frame = max(batas[n + 1] - batas[n], 1)
+        warna = WARNA_LATAR[(i - 1) % len(WARNA_LATAR)]
+        latar = f"{FOLDER}/latar_{n:03d}.png"
+        pos = buat_latar(naskah["judul"], kalimat, warna, latar)
+        out = f"{FOLDER}/klip_{n:03d}.mp4"
+        rakit_klip(latar, gambar_adegan[i], frame, pos, out)
+        klip.append(out)
+
+    # 5. sambung semua klip + tempel suara
     daftar = f"{FOLDER}/daftar.txt"
     with open(daftar, "w") as f:
         for k in klip:
             f.write(f"file '{os.path.basename(k)}'\n")
-    hasil = f"{FOLDER}/video_final.mp4"
+    gambar_saja = f"{FOLDER}/gambar_saja.mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-i", daftar, "-c", "copy", "-movflags", "+faststart", hasil],
+         "-i", daftar, "-c", "copy", gambar_saja],
+        check=True,
+    )
+    hasil = f"{FOLDER}/video_final.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", gambar_saja, "-i", suara,
+         "-filter_complex", "[1:a]apad[a]", "-map", "0:v", "-map", "[a]",
+         "-c:v", "copy", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "160k",
+         "-shortest", "-movflags", "+faststart", hasil],
         check=True,
     )
     log(f"  Video jadi: {hasil} ({durasi(hasil):.1f} detik)")
