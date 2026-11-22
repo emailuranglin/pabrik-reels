@@ -321,6 +321,10 @@ def tts_gemini(teks, path_wav):
     return False
 
 
+def tts_gemini_polos(teks, path_wav):
+    return _tts_gemini_sekali(teks, path_wav, False) == "ok"
+
+
 def _tts_gemini_sekali(teks, path_wav, pakai_gaya):
     isi = f"{GAYA_BACA}\n{teks}" if pakai_gaya else teks
     for model in MODEL_SUARA:
@@ -632,38 +636,105 @@ def normal(kata):
     return re.sub(r"[^a-z0-9]", "", kata.lower())
 
 
-def waktu_kata_whisper(kata_naskah, suara):
-    """Cari waktu mulai tiap kata dengan mendengarkan ulang narasinya (faster-whisper).
-    Mengembalikan list waktu mulai (detik) sepanjang kata_naskah, atau None jika gagal."""
+_model_whisper = None
+
+
+def dengarkan(suara):
+    """Transkrip narasi dengan faster-whisper: list (kata_normal, mulai, selesai, kata_asli)."""
+    global _model_whisper
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         log("  faster-whisper tidak terpasang, waktu subtitle pakai perkiraan.")
         return None
     try:
-        log(f"  Menyelaraskan subtitle dengan suara (whisper {MODEL_WHISPER})...")
-        model = WhisperModel(MODEL_WHISPER, device="cpu", compute_type="int8")
-        segmen, _ = model.transcribe(suara, language="id", word_timestamps=True, beam_size=1)
-        dengar = [(normal(w.word), w.start) for s in segmen for w in (s.words or [])]
+        if _model_whisper is None:
+            log(f"  Memuat pendengar suara (whisper {MODEL_WHISPER})...")
+            _model_whisper = WhisperModel(MODEL_WHISPER, device="cpu", compute_type="int8")
+        segmen, _ = _model_whisper.transcribe(
+            suara, language="id", word_timestamps=True, beam_size=1
+        )
+        hasil = [(normal(w.word), w.start, w.end, w.word.strip())
+                 for s in segmen for w in (s.words or [])]
     except Exception as e:  # noqa: BLE001
         log(f"  Whisper gagal ({e}), waktu subtitle pakai perkiraan.")
         return None
-    dengar = [(k, t) for k, t in dengar if k]
-    if len(dengar) < len(kata_naskah) * 0.5:
-        log("  Whisper hanya menangkap sedikit kata, waktu subtitle pakai perkiraan.")
-        return None
+    return [h for h in hasil if h[0]]
+
+
+def selaraskan(kata_naskah, dengar):
+    """Cocokkan kata naskah dengan kata yang terdengar.
+    Mengembalikan (waktu_mulai_per_kata, laporan)."""
     a = [normal(k) for k in kata_naskah]
-    b = [k for k, _ in dengar]
+    b = [h[0] for h in dengar]
     waktu = [None] * len(a)
-    cocok = 0
+    cocok_b = []
     for blok in difflib.SequenceMatcher(a=a, b=b, autojunk=False).get_matching_blocks():
         for n in range(blok.size):
             waktu[blok.a + n] = dengar[blok.b + n][1]
-            cocok += 1
-    log(f"  {cocok}/{len(a)} kata cocok dengan suara.")
-    if cocok < len(a) * 0.4:
-        return None
-    return waktu
+            cocok_b.append(blok.b + n)
+    laporan = {"cocok": len(cocok_b), "total": len(a)}
+    if cocok_b:
+        pertama, terakhir = min(cocok_b), max(cocok_b)
+        laporan["ekstra_awal"] = pertama
+        laporan["ekstra_akhir"] = len(b) - 1 - terakhir
+        laporan["potong_awal"] = dengar[pertama][1]
+        laporan["potong_akhir"] = dengar[terakhir][2]
+        # rangkaian kata asing terpanjang di tengah narasi
+        terpakai = set(cocok_b)
+        terpanjang, kini = 0, 0
+        for x in range(pertama, terakhir + 1):
+            kini = 0 if x in terpakai else kini + 1
+            terpanjang = max(terpanjang, kini)
+        laporan["ekstra_tengah"] = terpanjang
+        laporan["teks_awal"] = " ".join(h[3] for h in dengar[:pertama])
+        laporan["teks_akhir"] = " ".join(h[3] for h in dengar[terakhir + 1:])
+    return waktu, laporan
+
+
+def potong_audio(path, mulai, selesai):
+    sementara = path + ".potong.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+         "-ss", f"{max(mulai, 0):.3f}", "-to", f"{selesai:.3f}",
+         "-af", "afade=t=in:d=0.05", sementara],
+        check=True,
+    )
+    os.replace(sementara, path)
+
+
+def periksa_dan_selaraskan(kata, teks_narasi, suara):
+    """Dengarkan ulang narasi: buang kalimat yang tidak ada di naskah (mis. arahan yang ikut
+    terbaca) lalu kembalikan waktu mulai tiap kata. None = pakai perkiraan."""
+    for putaran in range(3):
+        dengar = dengarkan(suara)
+        if not dengar or len(dengar) < len(kata) * 0.5:
+            if dengar is not None:
+                log("  Whisper hanya menangkap sedikit kata, waktu subtitle pakai perkiraan.")
+            return None
+        waktu, lap = selaraskan(kata, dengar)
+        log("  Terdengar di awal: \"" + " ".join(h[3] for h in dengar[:12]) + " ...\"")
+        log("  Terdengar di akhir: \"... " + " ".join(h[3] for h in dengar[-10:]) + "\"")
+        log(f"  {lap['cocok']}/{lap['total']} kata cocok dengan suara.")
+        if lap["cocok"] < lap["total"] * 0.4:
+            return None
+        if lap["ekstra_tengah"] >= 6 and putaran == 0:
+            log(f"  Ada {lap['ekstra_tengah']} kata asing di tengah narasi. "
+                "Suara dibuat ulang tanpa arahan gaya.")
+            if tts_gemini_polos(teks_narasi, suara) or tts_edge(teks_narasi, suara):
+                rapikan_suara(suara, len(kata))
+                continue
+        if lap["ekstra_awal"] >= 2 or lap["ekstra_akhir"] >= 2:
+            if lap["ekstra_awal"] >= 2:
+                log(f"  Membuang ucapan di luar naskah (awal): \"{lap['teks_awal'][:120]}\"")
+            if lap["ekstra_akhir"] >= 2:
+                log(f"  Membuang ucapan di luar naskah (akhir): \"{lap['teks_akhir'][:120]}\"")
+            awal = lap["potong_awal"] - 0.15 if lap["ekstra_awal"] >= 2 else 0
+            akhir = lap["potong_akhir"] + 0.35 if lap["ekstra_akhir"] >= 2 else durasi(suara)
+            potong_audio(suara, awal, akhir)
+            continue  # dengarkan lagi supaya waktunya tepat
+        return waktu
+    return None
 
 
 def isi_waktu_kosong(kata, waktu, total):
@@ -791,7 +862,9 @@ def karyawan_editor(naskah):
     total = lama_suara + 0.8
 
     # 3. waktu tiap kata (didengarkan ulang, atau diperkirakan)
-    waktu = waktu_kata_whisper(kata, suara)
+    waktu = periksa_dan_selaraskan(kata, " ".join(kata), suara)
+    lama_suara = durasi(suara)  # bisa berubah kalau ada bagian yang dibuang
+    total = lama_suara + 0.8
     if waktu:
         mulai = isi_waktu_kosong(kata, waktu, lama_suara)
     else:
