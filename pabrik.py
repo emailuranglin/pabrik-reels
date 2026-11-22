@@ -268,33 +268,61 @@ Beri lolos=true hanya jika skor >= 7 dan tidak ada masalah keamanan."""
 
 
 # ---------------------------------------------------------------- Karyawan 4
-def karyawan_ilustrator(prompt, path):
+def _minta_gambar(prompt, path):
+    """Satu permintaan ke Cloudflare. Mengembalikan 'ok', 'tolak' (dianggap tidak aman) atau 'gagal'."""
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/run/{MODEL_GAMBAR}"
-    body = {"prompt": f"{prompt}. Style: {GAYA_GAMBAR}", "steps": 4}
-    for percobaan in range(3):
-        try:
-            r = requests.post(
-                url, headers={"Authorization": f"Bearer {CF_TOKEN}"}, json=body, timeout=120
-            )
-        except requests.RequestException as e:
-            log(f"  Koneksi Cloudflare gagal: {e}")
-            time.sleep(5)
-            continue
-        if r.status_code == 200:
-            ctype = r.headers.get("content-type", "")
-            if ctype.startswith("image/"):
-                data = r.content
-            else:
-                hasil = r.json().get("result", {})
-                data = base64.b64decode(hasil["image"])
-            with open(path, "wb") as f:
-                f.write(data)
+    body = {"prompt": f"{prompt}. Style: {GAYA_GAMBAR}", "steps": 4,
+            "seed": random.randint(1, 10_000_000)}
+    try:
+        r = requests.post(url, headers={"Authorization": f"Bearer {CF_TOKEN}"}, json=body, timeout=120)
+    except requests.RequestException as e:
+        log(f"  Koneksi Cloudflare gagal: {e}")
+        return "gagal"
+    if r.status_code == 200:
+        if r.headers.get("content-type", "").startswith("image/"):
+            data = r.content
+        else:
+            data = base64.b64decode(r.json().get("result", {})["image"])
+        with open(path, "wb") as f:
+            f.write(data)
+        return "ok"
+    if r.status_code in (401, 403):
+        sys.exit("[GAGAL] Token/Account ID Cloudflare salah, atau kuota gratis habis hari ini.")
+    if "NSFW" in r.text or "3030" in r.text or "8007" in r.text:
+        return "tolak"
+    log(f"  Cloudflare error {r.status_code}: {r.text[:200]}")
+    return "gagal"
+
+
+def gambar_cadangan(path):
+    """Kalau semua usaha gagal: gambar polos lembut, supaya video tetap jadi."""
+    img = Image.new("RGB", (1024, 1024), (250, 240, 225))
+    d = ImageDraw.Draw(img)
+    d.ellipse([462, 300, 562, 400], outline=(0, 0, 0), width=10)          # kepala
+    d.line([512, 400, 512, 620], fill=(0, 0, 0), width=10)                # badan
+    d.line([512, 460, 420, 560], fill=(0, 0, 0), width=10)                # tangan
+    d.line([512, 460, 604, 560], fill=(0, 0, 0), width=10)
+    d.line([512, 620, 440, 760], fill=(0, 0, 0), width=10)                # kaki
+    d.line([512, 620, 584, 760], fill=(0, 0, 0), width=10)
+    img.save(path)
+
+
+def karyawan_ilustrator(prompt, path):
+    # 1) prompt asli, 2) prompt asli seed lain, 3) prompt aman yang lebih umum
+    aman = ("a simple stickman standing in a cozy Indonesian home, thoughtful and emotional mood, "
+            "family drama scene")
+    for n, p in enumerate([prompt, prompt, aman]):
+        hasil = _minta_gambar(p, path)
+        if hasil == "ok":
+            if n == 2:
+                log("  (memakai gambar versi umum)")
             return
-        log(f"  Cloudflare error {r.status_code}: {r.text[:300]}")
-        if r.status_code in (401, 403):
-            sys.exit("[GAGAL] Token/Account ID Cloudflare salah atau kuota gratis habis hari ini.")
-        time.sleep(8)
-    sys.exit("[GAGAL] Gambar tidak berhasil dibuat.")
+        if hasil == "tolak":
+            log("  Prompt gambar dianggap sensitif oleh filter Cloudflare, coba versi lain...")
+        else:
+            time.sleep(6)
+    log("  Gambar tidak berhasil dibuat, memakai gambar stickman cadangan.")
+    gambar_cadangan(path)
 
 
 # ---------------------------------------------------------------- Karyawan 5
@@ -654,8 +682,22 @@ def dengarkan(suara):
         if _model_whisper is None:
             log(f"  Memuat pendengar suara (whisper {MODEL_WHISPER})...")
             _model_whisper = WhisperModel(MODEL_WHISPER, device="cpu", compute_type="int8")
+        # audio dibaca sendiri (tanpa PyAV) supaya tidak bentrok versi pustaka
+        import wave
+
+        import numpy as np
+
+        sementara = suara + ".16k.wav"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", suara, "-ar", "16000", "-ac", "1",
+             "-c:a", "pcm_s16le", sementara],
+            check=True,
+        )
+        with wave.open(sementara) as w:
+            audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+        os.remove(sementara)
         segmen, _ = _model_whisper.transcribe(
-            suara, language="id", word_timestamps=True, beam_size=1
+            audio, language="id", word_timestamps=True, beam_size=1
         )
         hasil = [(normal(w.word), w.start, w.end, w.word.strip())
                  for s in segmen for w in (s.words or [])]
@@ -941,8 +983,34 @@ def karyawan_editor(naskah):
 
 
 # ---------------------------------------------------------------- Karyawan 7
+def siapkan_token_page():
+    """Pastikan token yang dipakai adalah token PAGE. Kalau yang tersimpan token akun pribadi,
+    coba tukar otomatis menjadi token Page."""
+    global FB_TOKEN
+    r = requests.get("https://graph.facebook.com/me",
+                     params={"fields": "id,name", "access_token": FB_TOKEN}, timeout=30)
+    if r.status_code != 200:
+        sys.exit(f"[GAGAL] Token Facebook tidak valid / kedaluwarsa: {r.text[:300]}")
+    saya = r.json()
+    if saya.get("id") == FB_PAGE_ID:
+        log(f"  Token Page OK ({saya.get('name')}).")
+        return
+    log(f"  Token yang tersimpan adalah token akun '{saya.get('name')}', bukan token Page. "
+        "Mencoba mengambil token Page otomatis...")
+    r = requests.get(f"https://graph.facebook.com/{FB_PAGE_ID}",
+                     params={"fields": "access_token,name", "access_token": FB_TOKEN}, timeout=30)
+    token = r.json().get("access_token") if r.status_code == 200 else None
+    if not token:
+        sys.exit("[GAGAL] Tidak bisa mengambil token Page. Pastikan FB_PAGE_ID benar dan token dibuat "
+                 "dengan izin pages_show_list, pages_read_engagement, pages_manage_posts. "
+                 f"Detail: {r.text[:300]}")
+    FB_TOKEN = token
+    log(f"  Berhasil memakai token Page '{r.json().get('name')}'.")
+
+
 def karyawan_pengunggah(video, caption):
     log("\n[7] PENGUNGGAH: memposting Reels ke Page Facebook...")
+    siapkan_token_page()
     base = f"https://graph.facebook.com/{FB_PAGE_ID}/video_reels"
     r = requests.post(base, data={"upload_phase": "start", "access_token": FB_TOKEN}, timeout=60)
     if r.status_code != 200:
