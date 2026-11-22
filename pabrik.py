@@ -58,7 +58,8 @@ MODEL_GEMINI = [
     m.strip()
     for m in os.environ.get(
         "MODEL_GEMINI",
-        "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash,gemini-2.0-flash",
+        "gemini-3.8-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-flash-lite-latest,"
+        "gemini-3.6-flash,gemma-4-26b-a4b-it",
     ).split(",")
     if m.strip()
 ]
@@ -97,10 +98,14 @@ _model_aktif = None
 
 
 def tanya_gemini(perintah, json_mode=True, suhu=0.9):
-    """Kirim perintah ke Gemini, kembalikan teks (atau dict jika json_mode)."""
+    """Kirim perintah ke Gemini, kembalikan teks (atau dict jika json_mode).
+    Kalau satu model habis kuota / sudah dipensiunkan, otomatis pindah ke model lain."""
     global _model_aktif
-    daftar = [_model_aktif] if _model_aktif else MODEL_GEMINI
-    error_terakhir = None
+    daftar = list(MODEL_GEMINI)
+    if _model_aktif in daftar:
+        daftar.remove(_model_aktif)
+        daftar.insert(0, _model_aktif)
+    catatan = []
     for model in daftar:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -112,11 +117,11 @@ def tanya_gemini(perintah, json_mode=True, suhu=0.9):
         }
         if json_mode:
             body["generationConfig"]["responseMimeType"] = "application/json"
-        for percobaan in range(4):
+        for percobaan in range(3):
             try:
                 r = requests.post(url, json=body, timeout=120)
             except requests.RequestException as e:
-                error_terakhir = str(e)
+                catatan.append(f"{model}: koneksi gagal ({e})")
                 time.sleep(5)
                 continue
             if r.status_code == 200:
@@ -124,31 +129,49 @@ def tanya_gemini(perintah, json_mode=True, suhu=0.9):
                 try:
                     teks = data["candidates"][0]["content"]["parts"][0]["text"]
                 except (KeyError, IndexError):
-                    error_terakhir = f"jawaban kosong: {json.dumps(data)[:300]}"
+                    catatan.append(f"{model}: jawaban kosong")
                     time.sleep(3)
                     continue
-                _model_aktif = model
                 if not json_mode:
+                    _model_aktif = model
                     return teks.strip()
                 try:
-                    return json.loads(teks)
+                    hasil = json.loads(teks)
                 except json.JSONDecodeError:
                     cocok = re.search(r"\{.*\}", teks, re.S)
-                    if cocok:
-                        return json.loads(cocok.group(0))
-                    error_terakhir = "jawaban bukan JSON"
-                    continue
-            if r.status_code in (429, 500, 503):
-                tunggu = 20 * (percobaan + 1)
-                log(f"  Gemini sibuk/limit ({r.status_code}), tunggu {tunggu} detik...")
-                time.sleep(tunggu)
-                error_terakhir = r.text[:300]
+                    if not cocok:
+                        catatan.append(f"{model}: jawaban bukan JSON")
+                        continue
+                    hasil = json.loads(cocok.group(0))
+                if _model_aktif != model:
+                    log(f"  (memakai model {model})")
+                _model_aktif = model
+                return hasil
+            pesan = r.text[:400]
+            if r.status_code == 429:
+                if "PerDay" in pesan or "per day" in pesan.lower() or percobaan >= 1:
+                    log(f"  Kuota model {model} habis, pindah ke model lain...")
+                    catatan.append(f"{model}: kuota habis (429)")
+                    break
+                log(f"  Model {model} sedang dibatasi, tunggu 30 detik...")
+                time.sleep(30)
                 continue
-            # 404 / 400 model tidak ada -> coba model berikutnya
-            error_terakhir = f"{model}: {r.status_code} {r.text[:300]}"
+            if r.status_code in (500, 503):
+                log(f"  Server Gemini sibuk ({r.status_code}), tunggu 15 detik...")
+                time.sleep(15)
+                continue
+            if r.status_code == 400 and json_mode and "responseMimeType" in body["generationConfig"]:
+                # sebagian model (mis. Gemma) tidak mendukung mode JSON: ulangi tanpa itu
+                body["generationConfig"].pop("responseMimeType")
+                continue
+            # 404 = model sudah tidak ada, 400/403 = tidak boleh dipakai
+            log(f"  Model {model} tidak tersedia ({r.status_code}), coba model lain...")
+            catatan.append(f"{model}: {r.status_code}")
             break
-        log(f"  Model {model} tidak bisa dipakai, coba model lain...")
-    sys.exit(f"[GAGAL] Gemini tidak menjawab. Detail: {error_terakhir}")
+    if all("kuota habis" in c for c in catatan if c.split(":")[0]):
+        sys.exit("[GAGAL] Kuota gratis Gemini hari ini sudah habis untuk semua model. "
+                 "Kuota biasanya pulih sekitar jam 14.00-15.00 WIB. Detail: " + " | ".join(catatan))
+    sys.exit("[GAGAL] Gemini tidak menjawab. Detail: " + " | ".join(catatan))
 
 
 # ---------------------------------------------------------------- Karyawan 1-3
