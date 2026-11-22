@@ -279,7 +279,7 @@ def _minta_gambar(prompt, path, gaya=None):
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/run/{MODEL_GAMBAR}"
     gaya = GAYA_GAMBAR if gaya is None else gaya
     teks = f"{prompt}. Style: {gaya}" if gaya else prompt
-    body = {"prompt": teks[:2000], "steps": 6}
+    body = {"prompt": teks[:2000], "steps": 4}
     try:
         r = requests.post(url, headers={"Authorization": f"Bearer {CF_TOKEN}"}, json=body, timeout=120)
     except requests.RequestException as e:
@@ -293,6 +293,8 @@ def _minta_gambar(prompt, path, gaya=None):
         with open(path, "wb") as f:
             f.write(data)
         return "ok"
+    if r.status_code == 429 and "daily free allocation" in r.text:
+        return "kuota"
     if r.status_code in (401, 403):
         sys.exit("[GAGAL] Token/Account ID Cloudflare salah, atau kuota gratis habis hari ini.")
     if "NSFW" in r.text or "3030" in r.text or "8007" in r.text:
@@ -315,14 +317,17 @@ def gambar_cadangan(path):
     img.save(path)
 
 
+GAMBAR_CADANGAN_DIPAKAI = 0
+
+
 def karyawan_ilustrator(prompt, path):
+    global GAMBAR_CADANGAN_DIPAKAI
     aman = ("a simple stickman standing in a cozy Indonesian home, thoughtful and emotional mood, "
             "family drama scene")
     percobaan = [
         (prompt, GAYA_GAMBAR, "gaya utama"),
         (prompt, GAYA_GAMBAR_CADANGAN, "gaya cadangan"),
         (aman, GAYA_GAMBAR_CADANGAN, "adegan umum"),
-        (prompt, "", "tanpa gaya"),
     ]
     for p, gaya, label in percobaan:
         hasil = _minta_gambar(p, path, gaya)
@@ -330,8 +335,12 @@ def karyawan_ilustrator(prompt, path):
             if label != "gaya utama":
                 log(f"  (gambar dibuat dengan {label})")
             return
+        if hasil == "kuota":
+            sys.exit("[BERHENTI] Jatah gambar gratis Cloudflare hari ini sudah habis "
+                     "(pulih tiap jam 07.00 WIB). Tidak ada yang diposting.")
         if hasil == "gagal":
             time.sleep(5)
+    GAMBAR_CADANGAN_DIPAKAI += 1
     log("  [PERINGATAN] Semua percobaan gambar gagal, memakai gambar stickman cadangan.")
     gambar_cadangan(path)
 
@@ -1099,6 +1108,9 @@ def main():
     with open(f"{FOLDER}/naskah.json", "w", encoding="utf-8") as f:
         json.dump(naskah, f, ensure_ascii=False, indent=2)
 
+    if MODE == "posting" and GAMBAR_CADANGAN_DIPAKAI:
+        sys.exit(f"[BERHENTI] {GAMBAR_CADANGAN_DIPAKAI} gambar memakai stickman cadangan, "
+                 "kualitas kurang bagus. Video TIDAK diposting supaya Page tetap rapi.")
     if MODE == "posting":
         video_id = karyawan_pengunggah(video, caption)
         riwayat.append({"judul": naskah["judul"], "video_id": video_id,
