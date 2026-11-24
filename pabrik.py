@@ -41,6 +41,8 @@ FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
 FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "").strip()
 
 NAMA_PAGE = os.environ.get("NAMA_PAGE", "").strip()
+WATERMARK = os.environ.get("WATERMARK", "").strip()  # teks tambahan (opsional)
+LOGO = os.environ.get("LOGO", "").strip() or "logo.png"  # logo di tengah bagian atas
 # Mesin suara: auto = coba Gemini TTS (lebih ekspresif), kalau gagal pakai edge-tts
 MESIN_SUARA = os.environ.get("MESIN_SUARA", "auto").strip().lower() or "auto"
 SUARA_GEMINI = os.environ.get("SUARA_GEMINI", "").strip() or "Sulafat"  # suara hangat
@@ -614,7 +616,7 @@ def buat_latar(judul, warna, path):
     """Latar 1080x1920: judul di atas, bingkai gambar di tengah. Subtitle ditempel belakangan."""
     img = Image.new("RGB", (W, H), warna)
     d = ImageDraw.Draw(img)
-    tulis_tengah(d, judul.upper(), 120, font(54), 28, (255, 230, 150))
+    tulis_tengah(d, judul.upper(), 165, font(52), 30, (255, 230, 150))
     x0 = (W - UKURAN_GAMBAR) // 2
     y0 = 330
     d.rounded_rectangle(
@@ -623,6 +625,29 @@ def buat_latar(judul, warna, path):
     )
     if NAMA_PAGE:
         tulis_tengah(d, NAMA_PAGE, H - 110, font(34), 40, (220, 220, 220), bayangan=False)
+    if LOGO and os.path.exists(LOGO):
+        # logo di tengah bagian atas, di atas "pil" krem supaya tetap terbaca di latar gelap
+        logo = Image.open(LOGO).convert("RGBA")
+        lebar_logo = 250
+        logo = logo.resize((lebar_logo, round(logo.height * lebar_logo / logo.width)), Image.LANCZOS)
+        pad = 14
+        lapisan = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        dl = ImageDraw.Draw(lapisan)
+        x, y = (W - (logo.width + pad * 2)) // 2, 30  # tengah bagian atas
+        dl.rounded_rectangle([x, y, x + logo.width + pad * 2, y + logo.height + pad * 2],
+                             radius=22, fill=(247, 240, 228, 225))
+        lapisan.alpha_composite(logo, (x + pad, y + pad))
+        img = Image.alpha_composite(img.convert("RGBA"), lapisan).convert("RGB")
+    if WATERMARK:
+        # watermark teks semi-transparan di sudut kanan atas
+        lapisan = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        dl = ImageDraw.Draw(lapisan)
+        fw = font(32)
+        lebar = dl.textlength(WATERMARK, font=fw)
+        x, y = W - 40 - lebar, 40
+        dl.text((x + 2, y + 2), WATERMARK, font=fw, fill=(0, 0, 0, 110))
+        dl.text((x, y), WATERMARK, font=fw, fill=(255, 255, 255, 170))
+        img = Image.alpha_composite(img.convert("RGBA"), lapisan).convert("RGB")
     img.save(path)
     return x0, y0
 
