@@ -43,6 +43,15 @@ FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "").strip()
 NAMA_PAGE = os.environ.get("NAMA_PAGE", "").strip()
 WATERMARK = os.environ.get("WATERMARK", "").strip()  # teks tambahan (opsional)
 LOGO = os.environ.get("LOGO", "").strip() or "logo.png"  # logo di tengah bagian atas
+
+
+def cari_logo():
+    """Cari file logo walau namanya sedikit berbeda (Logo.PNG, logo (1).png, dll)."""
+    if os.path.exists(LOGO):
+        return LOGO
+    calon = sorted(f for f in os.listdir(".")
+                   if f.lower().startswith("logo") and f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")))
+    return calon[0] if calon else None
 # Mesin suara: auto = coba Gemini TTS (lebih ekspresif), kalau gagal pakai edge-tts
 MESIN_SUARA = os.environ.get("MESIN_SUARA", "auto").strip().lower() or "auto"
 SUARA_GEMINI = os.environ.get("SUARA_GEMINI", "").strip() or "Sulafat"  # suara hangat
@@ -625,9 +634,12 @@ def buat_latar(judul, warna, path):
     )
     if NAMA_PAGE:
         tulis_tengah(d, NAMA_PAGE, H - 110, font(34), 40, (220, 220, 220), bayangan=False)
-    if LOGO and os.path.exists(LOGO):
+    file_logo = cari_logo()
+    if file_logo:
         # logo di tengah bagian atas, di atas "pil" krem supaya tetap terbaca di latar gelap
-        logo = Image.open(LOGO).convert("RGBA")
+        logo = Image.open(file_logo).convert("RGBA")
+        if logo.getbbox():
+            logo = logo.crop(logo.getbbox())
         lebar_logo = 250
         logo = logo.resize((lebar_logo, round(logo.height * lebar_logo / logo.width)), Image.LANCZOS)
         pad = 14
@@ -1105,6 +1117,12 @@ def main():
         wajib("FB_PAGE_ID", FB_PAGE_ID)
         wajib("FB_PAGE_TOKEN", FB_TOKEN)
 
+    file_logo = cari_logo()
+    if file_logo:
+        log(f"Watermark logo: {file_logo}")
+    else:
+        log("[PERINGATAN] File logo.png tidak ditemukan di gudang GitHub, video dibuat TANPA logo. "
+            f"Isi folder: {', '.join(sorted(os.listdir('.')))}")
     riwayat = baca_riwayat()
     ide = karyawan_perencana(riwayat)
 
