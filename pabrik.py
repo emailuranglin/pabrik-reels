@@ -49,8 +49,17 @@ def cari_logo():
     """Cari file logo walau namanya sedikit berbeda (Logo.PNG, logo (1).png, dll)."""
     if os.path.exists(LOGO):
         return LOGO
-    calon = sorted(f for f in os.listdir(".")
-                   if f.lower().startswith("logo") and f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")))
+    induk = os.path.splitext(os.path.basename(LOGO))[0].lower()  # mis. "logo" atau "logo_horor"
+    calon = []
+    for nama in os.listdir("."):
+        n = nama.lower()
+        if not n.endswith((".png", ".jpg", ".jpeg", ".webp")) or not n.startswith(induk):
+            continue
+        sisa = n[len(induk):]
+        if sisa[:1] in ("_", "-") and sisa[1:2].isalpha():
+            continue  # "logo_horor.png" bukan milik "logo.png"
+        calon.append(nama)
+    calon.sort()
     return calon[0] if calon else None
 # Mesin suara: auto = coba Gemini TTS (lebih ekspresif), kalau gagal pakai edge-tts
 MESIN_SUARA = os.environ.get("MESIN_SUARA", "auto").strip().lower() or "auto"
@@ -78,7 +87,11 @@ MODEL_WHISPER = os.environ.get("MODEL_WHISPER", "").strip() or "base"
 MODEL_GAMBAR = os.environ.get("MODEL_GAMBAR", "@cf/black-forest-labs/flux-1-schnell")
 
 FOLDER = "hasil"
-RIWAYAT = "riwayat.json"
+# NICHE: "drama" (drama keluarga, bawaan) atau "horor" (horor/misteri pendek)
+NICHE = (os.environ.get("NICHE", "").strip().lower() or "drama")
+if NICHE not in ("drama", "horor"):
+    NICHE = "drama"
+RIWAYAT = "riwayat.json" if NICHE == "drama" else f"riwayat_{NICHE}.json"
 W, H = 1080, 1920          # ukuran video vertikal Reels
 FPS = 30
 UKURAN_GAMBAR = 1000        # gambar ilustrasi persegi di tengah layar
@@ -95,6 +108,17 @@ WARNA_LATAR = [
     (58, 84, 70), (110, 70, 60), (60, 60, 75),
 ]
 
+if NICHE == "horor":
+    GAYA_GAMBAR = (
+        "dark eerie minimalist flat 2D illustration, simple black silhouette characters without faces, "
+        "moody night scene, dim cold blue moonlight with a hint of faint red, light fog, long shadows, "
+        "Indonesian setting, suspenseful atmosphere, no blood, no gore, no text, no letters, no watermark"
+    )
+    WARNA_LATAR = [
+        (18, 18, 24), (24, 20, 30), (16, 24, 30), (30, 18, 20),
+        (20, 22, 20), (26, 24, 34), (14, 16, 22),
+    ]
+
 
 def log(pesan):
     print(pesan, flush=True)
@@ -106,6 +130,8 @@ def wajib(nama, nilai):
 
 
 # ---------------------------------------------------------------- Gemini
+# Kunci dikirim lewat header: cocok untuk format lama (AIza...) maupun baru (AQ....)
+KEPALA_GEMINI = {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
 _model_aktif = None
 
 
@@ -121,7 +147,7 @@ def tanya_gemini(perintah, json_mode=True, suhu=0.9):
     for model in daftar:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={GEMINI_KEY}"
+            f"{model}:generateContent"
         )
         body = {
             "contents": [{"role": "user", "parts": [{"text": perintah}]}],
@@ -131,7 +157,7 @@ def tanya_gemini(perintah, json_mode=True, suhu=0.9):
             body["generationConfig"]["responseMimeType"] = "application/json"
         for percobaan in range(3):
             try:
-                r = requests.post(url, json=body, timeout=120)
+                r = requests.post(url, json=body, headers=KEPALA_GEMINI, timeout=120)
             except requests.RequestException as e:
                 catatan.append(f"{model}: koneksi gagal ({e})")
                 time.sleep(5)
@@ -172,6 +198,12 @@ def tanya_gemini(perintah, json_mode=True, suhu=0.9):
                 log(f"  Server Gemini sibuk ({r.status_code}), tunggu 15 detik...")
                 time.sleep(15)
                 continue
+            if r.status_code in (401, 403) and ("API key" in pesan or "UNAUTHENTICATED" in pesan
+                                                 or "ACCESS_TOKEN" in pesan or "PERMISSION" in pesan):
+                sys.exit("[GAGAL] Kunci Gemini ditolak. Pastikan secret GEMINI_API_KEY"
+                         + ("_HOROR" if NICHE == "horor" else "")
+                         + " berisi kunci lengkap dari AI Studio (boleh diawali AIza... atau AQ.). "
+                         f"Detail: {pesan[:300]}")
             if r.status_code == 400 and json_mode and "responseMimeType" in body["generationConfig"]:
                 # sebagian model (mis. Gemma) tidak mendukung mode JSON: ulangi tanpa itu
                 body["generationConfig"].pop("responseMimeType")
@@ -210,7 +242,25 @@ TEMA = [
 ]
 
 
+TEMA_HOROR = [
+    "pengemudi ojol yang menerima pesanan tengah malam ke alamat yang ternyata kosong",
+    "anak kos baru yang mendengar ketukan dari kamar sebelah yang tidak berpenghuni",
+    "satpam shift malam yang melihat lift bergerak sendiri",
+    "kurir paket yang diminta menaruh barang di rumah tua",
+    "pegawai minimarket 24 jam yang melayani pembeli aneh pukul 3 pagi",
+    "perawat jaga malam yang dipanggil dari kamar pasien yang sudah pulang",
+    "pendaki yang tersesat dan bertemu warung di tengah hutan",
+    "penumpang bus malam terakhir yang tidak pernah turun",
+    "suara yang memanggil nama dari luar jendela saat sendirian di rumah",
+    "foto lama keluarga yang berubah setiap malam",
+    "pesan suara dari nomor seseorang yang sudah lama tiada",
+    "kampung yang selalu sepi setiap malam Jumat",
+]
+
+
 def karyawan_perencana(riwayat):
+    if NICHE == "horor":
+        return perencana_horor(riwayat)
     log("\n[1] PERENCANA: mencari ide kisah...")
     judul_lama = [r.get("judul", "") for r in riwayat[-40:]]
     tema = random.choice(TEMA)
@@ -230,7 +280,30 @@ Jawab JSON: {{"judul": "...", "ringkasan": "3-4 kalimat alur kisah dari awal sam
     return ide
 
 
+def perencana_horor(riwayat):
+    log("\n[1] PERENCANA: mencari ide kisah horor...")
+    judul_lama = [r.get("judul", "") for r in riwayat[-40:]]
+    tema = random.choice(TEMA_HOROR)
+    perintah = f"""Kamu perencana konten Page Facebook Indonesia bertema HOROR / MISTERI PENDEK.
+Buat SATU ide kisah fiksi baru untuk video Reels 60 detik.
+Arah tema hari ini: {tema}.
+
+Syarat:
+- Kisah fiksi sehari-hari di Indonesia (ojol, kos-kosan, kerja malam, kampung, dll) yang bikin penasaran
+  dan merinding, dengan plot twist mengejutkan di akhir.
+- Seram lewat suasana dan ketegangan, BUKAN lewat darah atau kekerasan. Tanpa adegan sadis, tanpa luka, tanpa bunuh diri.
+- Tidak menghina agama atau kepercayaan, tidak menyebut nama tempat nyata yang spesifik atau tokoh nyata.
+- Tidak boleh mirip judul-judul yang sudah pernah dibuat ini: {json.dumps(judul_lama, ensure_ascii=False)}
+
+Jawab JSON: {{"judul": "...", "ringkasan": "3-4 kalimat alur dari awal sampai twist", "twist": "1 kalimat"}}"""
+    ide = tanya_gemini(perintah)
+    log(f"  Ide: {ide.get('judul')}")
+    return ide
+
+
 def karyawan_penulis(ide, catatan_revisi=None):
+    if NICHE == "horor":
+        return penulis_horor(ide, catatan_revisi)
     log("\n[2] PENULIS: menulis naskah..." + (" (revisi)" if catatan_revisi else ""))
     revisi = ""
     if catatan_revisi:
@@ -257,16 +330,46 @@ Jawab JSON:
     return tanya_gemini(perintah)
 
 
+def penulis_horor(ide, catatan_revisi=None):
+    log("\n[2] PENULIS: menulis naskah horor..." + (" (revisi)" if catatan_revisi else ""))
+    revisi = ""
+    if catatan_revisi:
+        revisi = f"\nIni revisi. Perbaiki sesuai catatan pemeriksa: {catatan_revisi}\n"
+    perintah = f"""Kamu penulis naskah video Reels horor Facebook berbahasa Indonesia, gaya bercerita orang pertama ("aku")
+yang mencekam dan bikin penasaran sampai detik terakhir.
+Tulis naskah berdasarkan ide ini:
+{json.dumps(ide, ensure_ascii=False)}
+{revisi}
+Aturan naskah:
+- Total narasi 120-150 kata (sekitar 55-65 detik dibacakan).
+- Kalimat pembuka (hook) langsung bikin merinding, maksimal 12 kata.
+- Bagi menjadi 5 atau 6 adegan. Tiap adegan 1-3 kalimat pendek. Bahasa lisan sehari-hari, tempo membangun ketegangan.
+- Adegan terakhir berisi twist mengejutkan, lalu ajakan ringan berkomentar (contoh: "Kamu pernah ngalamin yang kayak gini?").
+- Seram lewat suasana; TANPA darah, luka, kekerasan sadis, atau bunuh diri.
+- Untuk tiap adegan, tulis prompt_gambar dalam BAHASA INGGRIS: deskripsi visual singkat (siapa, sedang apa, di mana),
+  tokoh berupa siluet hitam tanpa wajah, suasana malam yang gelap dan berkabut.
+  Jangan menyebut darah, mayat, senjata, atau teks/tulisan di gambar.
+- Caption Facebook: 2-3 kalimat yang memancing rasa penasaran + pertanyaan untuk komentar. Jangan clickbait palsu.
+- 4-6 hashtag bahasa Indonesia yang relevan (contoh: #kisahhoror #ceritaseram).
+
+Jawab JSON:
+{{"judul": "...", "adegan": [{{"narasi": "...", "prompt_gambar": "..."}}],
+  "caption": "...", "hashtag": ["#...", "#..."]}}"""
+    return tanya_gemini(perintah)
+
+
 def karyawan_pemeriksa(naskah):
     log("\n[3] PEMERIKSA: mengecek kualitas naskah...")
-    perintah = f"""Kamu editor quality control untuk Page Facebook drama keluarga. Periksa naskah ini dengan teliti:
+    jenis = "drama keluarga" if NICHE == "drama" else "horor / misteri pendek"
+    perintah = f"""Kamu editor quality control untuk Page Facebook {jenis}. Periksa naskah ini dengan teliti:
 {json.dumps(naskah, ensure_ascii=False)}
 
 Cek:
 1. Bahasa Indonesia benar, alami, enak dibacakan, tidak ada kalimat aneh.
-2. Alur masuk akal, hook kuat, twist dan pelajaran jelas.
+2. Alur masuk akal, hook kuat, twist jelas{" dan ada pelajaran" if NICHE == "drama" else ", suasana tegang dan seram"}.
 3. Panjang total narasi 110-160 kata, 5-6 adegan.
-4. Aman monetisasi: tanpa kekerasan sadis, konten dewasa, SARA, ujaran kebencian, informasi medis/agama yang keliru.
+4. Aman monetisasi: tanpa kekerasan sadis, darah/luka, bunuh diri, konten dewasa, SARA, ujaran kebencian,
+   penghinaan agama, informasi medis/agama yang keliru.
 5. Tidak mengaku kisah nyata, tidak memakai nama tokoh/merek nyata.
 6. Caption tidak clickbait yang menipu.
 7. Semua prompt_gambar berbahasa Inggris dan tidak meminta teks di dalam gambar.
@@ -283,6 +386,10 @@ GAYA_GAMBAR_CADANGAN = (
     "cute minimalist stick figure doodle, black outline drawing, simple flat 2D cartoon, "
     "plain light background, no text"
 )
+if NICHE == "horor":
+    GAYA_GAMBAR_CADANGAN = (
+        "simple dark silhouette illustration, night scene, fog, moody blue tones, flat 2D, no text"
+    )
 
 
 def _minta_gambar(prompt, path, gaya=None):
@@ -335,6 +442,9 @@ def karyawan_ilustrator(prompt, path):
     global GAMBAR_CADANGAN_DIPAKAI
     aman = ("a simple stickman standing in a cozy Indonesian home, thoughtful and emotional mood, "
             "family drama scene")
+    if NICHE == "horor":
+        aman = ("a lone silhouette standing in a quiet dark alley at night, light fog, "
+                "dim moonlight, mysterious mood")
     percobaan = [
         (prompt, GAYA_GAMBAR, "gaya utama"),
         (prompt, GAYA_GAMBAR_CADANGAN, "gaya cadangan"),
@@ -390,7 +500,7 @@ def _tts_gemini_sekali(teks, path_wav, pakai_gaya):
     for model in MODEL_SUARA:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={GEMINI_KEY}"
+            f"{model}:generateContent"
         )
         body = {
             "contents": [{"parts": [{"text": isi}]}],
@@ -403,7 +513,7 @@ def _tts_gemini_sekali(teks, path_wav, pakai_gaya):
         }
         for percobaan in range(2):
             try:
-                r = requests.post(url, json=body, timeout=300)
+                r = requests.post(url, json=body, headers=KEPALA_GEMINI, timeout=300)
             except requests.RequestException as e:
                 log(f"  Gemini TTS koneksi gagal: {e}")
                 time.sleep(5)
@@ -1109,7 +1219,7 @@ def karyawan_pengunggah(video, caption):
 
 # ---------------------------------------------------------------- Bos
 def main():
-    log(f"=== PABRIK REELS mulai (mode: {MODE}) ===")
+    log(f"=== PABRIK REELS mulai (mode: {MODE}, niche: {NICHE}) ===")
     wajib("GEMINI_API_KEY", GEMINI_KEY)
     wajib("CF_ACCOUNT_ID", CF_ACCOUNT)
     wajib("CF_API_TOKEN", CF_TOKEN)
@@ -1143,7 +1253,7 @@ def main():
     caption = (
         f"{naskah['caption']}\n\n"
         "📖 Cerita fiksi. Ilustrasi & suara dibuat dengan bantuan AI.\n\n"
-        f"{hashtag} #kisahfiksi"
+        f"{hashtag} #kisahfiksi" + (" #ceritahoror" if NICHE == "horor" else "")
     )
     os.makedirs(FOLDER, exist_ok=True)
     with open(f"{FOLDER}/caption.txt", "w", encoding="utf-8") as f:
